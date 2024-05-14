@@ -89,7 +89,7 @@ def get_relationships(
     result = []
     for type in spec.relationship_types:
         query = """
-            MATCH (n)-[r]-(n2)
+            MATCH (n)-[r]->(n2)
             WHERE any(label IN labels(n) WHERE label IN $labels) AND any(label IN labels(n2) WHERE label IN $labels) AND type(r) in $types
             RETURN n, r, n2
         """
