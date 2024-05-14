@@ -64,18 +64,21 @@ def get_nodes(creds: Neo4jCredentials, spec: TransferSpec) -> list[Nodes]:
         if len(records) > 0:
             logger.info(f"\n First Node: {records[0]}")
 
-        records = []
+        converted_records = []
         for n in records:
             node = n.data()["n"]
             # Add original element id if specified in transfer spec
             element_id = n.values()[0].element_id
             node.update({spec.transfer_key: element_id})
 
-            records.append(node)
+            converted_records.append(node)
 
-        nodes_spec = Nodes(labels=[label], key=spec.transfer_key, records=records)
+        nodes_spec = Nodes(
+            labels=[label], key=spec.transfer_key, records=converted_records
+        )
 
         result.append(nodes_spec)
+
     return result
 
 
@@ -104,6 +107,7 @@ def get_relationships(
             record_key=f"_to_{spec.transfer_key}",
         )
 
+        converted_records = []
         for rec in records:
             from_eid = rec.values()[0].element_id
             to_eid = rec.values()[2].element_id
@@ -114,14 +118,16 @@ def get_relationships(
                 f"_to_{spec.transfer_key}": to_eid,
                 spec.transfer_key: r_eid,
             }
+            converted_records.append(rel_rec)
 
         rels_spec = Relationships(
             type=type,
             from_node=source_node,
             to_node=target_node,
-            records=[rel_rec],
+            records=converted_records,
         )
         result.append(rels_spec)
+
     return result
 
 
