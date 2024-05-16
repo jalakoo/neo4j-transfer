@@ -1,8 +1,5 @@
 from neo4j import GraphDatabase
 from neo4j_transfer.models import Neo4jCredentials
-import logging
-
-logger = logging.getLogger("neo4j_transfer")
 
 
 def validate_credentials(creds: Neo4jCredentials):
@@ -12,9 +9,9 @@ def validate_credentials(creds: Neo4jCredentials):
         driver.verify_connectivity()
 
 
-def execute_query(creds: Neo4jCredentials, query, params={}, database: str = "neo4j"):
+def execute_query(creds: Neo4jCredentials, query, params={}):
     # Returns a tuple of records, summary, keys
     with GraphDatabase.driver(
         creds.uri, auth=(creds.username, creds.password)
     ) as driver:
-        return driver.execute_query(query, params, database=database)
+        return driver.execute_query(query, params, database=creds.database)
