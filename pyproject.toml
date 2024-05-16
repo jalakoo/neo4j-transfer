@@ -8,7 +8,7 @@ packages = [{include = "neo4j_transfer"}]
 
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.11"
 pydantic = "^2.7.1"
 neo4j-uploader = "^0.5.3"
 
