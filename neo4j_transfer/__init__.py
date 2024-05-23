@@ -32,14 +32,16 @@ def transfer(
 
     logger.info(f'Getting nodes from source database "{source_creds.uri}"...')
     nodes = get_nodes(source_creds, spec)
-    logger.info(f"Node Specs for upload: {nodes}")
+    logger.info(f"Node Specs for upload: {len(nodes)}")
 
     logger.info(f'Getting relationships from source database "{source_creds.uri}"...')
     rels = get_relationships(source_creds, spec)
-    logger.info(f"Relationship Specs for upload: {rels}")
+    logger.info(f"Relationship Specs for upload: {len(rels)}")
 
     logger.info(f'Uploading data to target database "{target_creds.uri}"...')
     result = upload(target_creds, nodes, rels)
+
+    logger.info(f"Upload complete! {result}")
 
     return result
 
@@ -131,6 +133,9 @@ def get_nodes(creds: Neo4jCredentials, spec: TransferSpec) -> list[Nodes]:
                     logger.warning(f"Node has no {sid_key} property. Skipping: {node}")
                     continue
                 node.update({tid_key: uid})
+
+            # remove original source node key id from data to transfer. Will be replaced with the tid
+            node.pop(sid_key)
 
             # Append optional timestamp separately
             if spec.timestamp_key is not None:
@@ -244,11 +249,16 @@ def get_relationships(
                 )
                 continue
 
-            # Create a relationship dictionary
-            record_dict = {
-                from_target_key: from_key_value,
-                to_target_key: to_key_value,
-            }
+            # Create a relationship dictionary from properties
+            record_dict = dict(**r.values()[1]._properties)
+
+            # TODO: Add relationship unique id
+            record_dict.update(
+                {
+                    from_target_key: from_key_value,
+                    to_target_key: to_key_value,
+                }
+            )
 
             if spec.timestamp_key is not None:
                 record_dict.update(
