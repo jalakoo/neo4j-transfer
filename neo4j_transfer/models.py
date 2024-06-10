@@ -53,6 +53,8 @@ class TransferSpec(BaseModel):
 
         timestamp (datetime): Timestamp of transfer. Defaults to datetime when the TransferSpec object created.
 
+        overwrite_target (bool): Should the target database data be overwritten (deleted prior to upload). Defaults to False.
+
     """
 
     node_labels: list[str]
@@ -61,6 +63,7 @@ class TransferSpec(BaseModel):
     element_id_key: str = "_transfer_element_id"
     timestamp_key: str = "_transfer_timestamp"
     timestamp: datetime = Field(default_factory=datetime.now)
+    overwrite_target: bool = False
 
     def __hash__(self):
         return hash((type(self),) + tuple(self.dict().items()))

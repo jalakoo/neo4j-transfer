@@ -14,13 +14,17 @@ from datetime import datetime
 
 
 def transfer(
-    source_creds: Neo4jCredentials, target_creds: Neo4jCredentials, spec: TransferSpec
+    source_creds: Neo4jCredentials,
+    target_creds: Neo4jCredentials,
+    spec: TransferSpec,
 ):
     """Transfer data from one Neo4j instance to another.
 
     Args:
         source_creds (Neo4jCredentials): Credentials for the source Neo4j instance
+
         target_creds (Neo4jCredentials): Credentials for the target Neo4j instance
+
         spec (TransferSpec): Specification for the data transfer
 
     Returns:
@@ -33,7 +37,12 @@ def transfer(
     nodes = get_nodes(source_creds, spec)
     rels = get_relationships(source_creds, spec)
 
-    result = upload(target_creds, nodes, rels)
+    result = upload(
+        target_creds,
+        nodes,
+        rels,
+        spec.overwrite_target,
+    )
 
     return result
 
@@ -54,14 +63,29 @@ def undo(creds: Neo4jCredentials, spec: TransferSpec):
 
 
 def upload(
-    creds: Neo4jCredentials, nodes: list[Nodes], relationships: list[Relationships]
+    creds: Neo4jCredentials,
+    nodes: list[Nodes],
+    relationships: list[Relationships],
+    overwrite: bool = False,
 ):
+    """Upload the data to the target Neo4j instance
+
+    Args:
+        creds (Neo4jCredentials): Neo4j Credentials object for the target Neo4j instance
+
+        nodes (list[Nodes]): List of Nodes to upload
+        relationships (list[Relationships]): List of Relationships to upload
+        overwrite (bool, optional): Should the target database data be overwritten (deleted prior to upload). Defaults to False.
+
+    Returns:
+        UploadResults: UploadResults object from the Neo4j uploader package.
+    """
 
     n4j_config = Neo4jConfig(
         neo4j_uri=creds.uri,
         neo4j_user=creds.username,
         neo4j_password=creds.password,
-        overwrite=False,
+        overwrite=overwrite,
     )
     graph_data = GraphData(nodes=nodes, relationships=relationships)
 
