@@ -2,7 +2,7 @@ from neo4j_transfer.models import Neo4jCredentials, TransferSpec
 from neo4j_transfer.n4j import validate_credentials, execute_query
 from neo4j_transfer._logger import logger
 import neo4j_transfer.errors as errors_
-from neo4j_uploader import batch_upload
+from neo4j_uploader import batch_upload, batch_upload_generator
 from neo4j_uploader.models import (
     Relationships,
     TargetNode,
@@ -45,6 +45,38 @@ def transfer(
     )
 
     return result
+
+
+def transfer_generator(
+    source_creds: Neo4jCredentials,
+    target_creds: Neo4jCredentials,
+    spec: TransferSpec,
+):
+    """Transfer data from one Neo4j instance to another.
+
+    Args:
+        source_creds (Neo4jCredentials): Credentials for the source Neo4j instance
+
+        target_creds (Neo4jCredentials): Credentials for the target Neo4j instance
+
+        spec (TransferSpec): Specification for the data transfer
+
+    Returns:
+        A generator of neo4j_uploader.models.UploadResult objects with details of the upload
+    """
+
+    validate_credentials(source_creds)
+    validate_credentials(target_creds)
+
+    nodes = get_nodes(source_creds, spec)
+    rels = get_relationships(source_creds, spec)
+
+    return upload_generator(
+        target_creds,
+        nodes,
+        rels,
+        spec.overwrite_target,
+    )
 
 
 def undo(creds: Neo4jCredentials, spec: TransferSpec):
@@ -94,8 +126,64 @@ def upload(
     return result
 
 
+def upload_generator(
+    creds: Neo4jCredentials,
+    nodes: list[Nodes],
+    relationships: list[Relationships],
+    overwrite: bool = False,
+):
+    """Upload the data to the target Neo4j instance
+
+    Args:
+        creds (Neo4jCredentials): Neo4j Credentials object for the target Neo4j instance
+
+        nodes (list[Nodes]): List of Nodes to upload
+        relationships (list[Relationships]): List of Relationships to upload
+        overwrite (bool, optional): Should the target database data be overwritten (deleted prior to upload). Defaults to False.
+
+    Returns:
+        UploadResults: Generator of UploadResults object from the Neo4j uploader package.
+    """
+
+    n4j_config = Neo4jConfig(
+        neo4j_uri=creds.uri,
+        neo4j_user=creds.username,
+        neo4j_password=creds.password,
+        overwrite=overwrite,
+    )
+    graph_data = GraphData(nodes=nodes, relationships=relationships)
+
+    result = batch_upload_generator(n4j_config, graph_data)
+
+    return result
+
+
+def get_node_dicts(creds: Neo4jCredentials, spec: TransferSpec) -> list[dict]:
+    """Retrieve Nodes and convert to a list of dicts from source"""
+    result = []
+    for label in spec.node_labels:
+
+        nodes_query = f"""
+            MATCH (n:`{label}`)
+            RETURN n
+            """
+        records, _, _ = execute_query(creds, nodes_query)
+
+        logger.info(f"\n Number of {label} nodes: {len(records)}")
+        if len(records) > 0:
+            logger.info(f"\n First Node: {records[0]}")
+
+        converted_records = []
+        for n in records:
+            node_raw = n.data()["n"]
+            converted_records.append(node_raw)
+
+        result.extend(converted_records)
+    return result
+
+
 def get_nodes(creds: Neo4jCredentials, spec: TransferSpec) -> list[Nodes]:
-    """Retrieve Nodes from source and format for uploading"""
+    """Retrieve Nodes and convert to a list of Uploader Nodes Spec from source and format for uploading"""
 
     # Get nodes and convert to upload format
     result = []
