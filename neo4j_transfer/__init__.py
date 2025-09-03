@@ -1,294 +1,390 @@
-from neo4j_transfer.models import Neo4jCredentials, TransferSpec
+from neo4j_transfer.models import Neo4jCredentials, TransferSpec, UploadResult
 from neo4j_transfer.n4j import validate_credentials, execute_query
 from neo4j_transfer._logger import logger
-import neo4j_transfer.errors as errors_
-from neo4j_uploader import batch_upload, batch_upload_generator
-from neo4j_uploader.models import (
-    Relationships,
-    TargetNode,
-    Nodes,
-    Neo4jConfig,
-    GraphData,
-)
+from neo4j import GraphDatabase, Driver, Session
+from typing import List, Dict, Any, Generator
+from collections import defaultdict
 from datetime import datetime
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
+
+DEFAULT_BATCH_SIZE = 50000
+
+###############################################################################
+# Private Helper Functions
+###############################################################################
+
+def _safe_label(name: str) -> str:
+    """Ensure the supplied label/rel-type is a bare identifier."""
+    if name.isidentifier():
+        return f"`{name}`"
+    raise ValueError(f"Illegal label/type: {name!r}")
+
+def _batch_create_nodes(
+    tgt_sess: Session,
+    rows: List[dict[str, Any]],
+    id_map: Dict[str, str],
+) -> None:
+    """Insert a batch of nodes in one round-trip."""
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        lbl_key = tuple(sorted(r["labels"]))
+        groups[lbl_key].append(r)
+
+    for labels, batch in groups.items():
+        label_fragment = ":" + ":".join(_safe_label(l) for l in labels) if labels else ""
+        cypher = f"""
+        UNWIND $batch AS row
+        CREATE (n{label_fragment})
+        SET n = row.props
+        RETURN elementId(n) AS new_id, row.eid AS old_id
+        """
+        for rec in tgt_sess.run(cypher, batch=batch):
+            id_map[rec["old_id"]] = rec["new_id"]
+
+def _batch_create_relationships(
+    tgt_sess: Session,
+    rows: List[dict[str, Any]],
+) -> List[Dict]:
+    """Insert a batch of relationships in one round-trip."""
+    relationships: List[Dict] = []
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        groups[r["type"]].append(r)
+
+    for rel_type, batch in groups.items():
+        cypher = f"""
+        UNWIND $batch AS row
+        MATCH (a) WHERE elementId(a) = row.start
+        MATCH (b) WHERE elementId(b) = row.end
+        CREATE (a)-[r:{_safe_label(rel_type)}]->(b)
+        SET r = row.props
+        RETURN elementId(r) AS rel_id, type(r) AS rel_type, elementId(a) AS start_id, elementId(b) AS end_id
+        """
+        for rec in tgt_sess.run(cypher, batch=batch):
+            relationships.append({
+                "rel_id": rec["rel_id"],
+                "type": rec["rel_type"],
+                "start_node": rec["start_id"],
+                "end_node": rec["end_id"]
+            })
+    
+    return relationships
+
+def _copy_nodes(
+    src: Session, 
+    tgt: Session, 
+    labels: List[str], 
+    page_size: int = DEFAULT_BATCH_SIZE
+) -> Dict[str, str]:
+    """Copy nodes with specified labels."""
+    id_map: Dict[str, str] = {}
+    skip = 0
+
+    while True:
+        if labels:
+            result = src.run(
+                """
+                MATCH (n)
+                WHERE any(label IN labels(n) WHERE label IN $labels)
+                WITH n SKIP $skip LIMIT $limit
+                RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props
+                """,
+                skip=skip, limit=page_size, labels=labels
+            )
+        else:
+            result = src.run(
+                """
+                MATCH (n)
+                WITH n SKIP $skip LIMIT $limit
+                RETURN elementId(n) AS eid, labels(n) AS labels, properties(n) AS props
+                """,
+                skip=skip, limit=page_size
+            )
+        
+        batch = [dict(record) for record in result]
+        if not batch:
+            break
+        
+        _batch_create_nodes(tgt, batch, id_map)
+        skip += page_size
+        logger.info(f"    … {skip} nodes processed")
+
+    return id_map
+
+def _copy_relationships(
+    src: Session,
+    tgt: Session,
+    id_map: Dict[str, str],
+    types: List[str] = None,
+    page_size: int = DEFAULT_BATCH_SIZE
+) -> List[Dict]:
+    """Copy relationships with optional type filtering."""
+    all_relationships: List[Dict] = []
+    skip = 0
+
+    while True:
+        if types:
+            result = src.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE type(r) IN $types
+                WITH r, a, b SKIP $skip LIMIT $limit
+                RETURN type(r) AS type, elementId(a) AS start, elementId(b) AS end, properties(r) AS props
+                """,
+                skip=skip, limit=page_size, types=types
+            )
+        else:
+            result = src.run(
+                """
+                MATCH (a)-[r]->(b)
+                WITH r, a, b SKIP $skip LIMIT $limit
+                RETURN type(r) AS type, elementId(a) AS start, elementId(b) AS end, properties(r) AS props
+                """,
+                skip=skip, limit=page_size
+            )
+
+        batch = []
+        for rec in result:
+            start_tgt = id_map.get(rec["start"])
+            end_tgt = id_map.get(rec["end"])
+            if start_tgt and end_tgt:
+                batch.append({
+                    "type": rec["type"],
+                    "start": start_tgt,
+                    "end": end_tgt,
+                    "props": rec["props"],
+                })
+
+        if not batch:
+            break
+
+        batch_relationships = _batch_create_relationships(tgt, batch)
+        all_relationships.extend(batch_relationships)
+        skip += page_size
+        logger.info(f"    … {skip} relationships processed")
+
+    return all_relationships
+
+def _reset_target_db(creds: Neo4jCredentials, batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+    """Reset target database by dropping constraints, indexes, and all data."""
+    logger.info("=== Resetting Target DB ===")
+
+    driver: Driver = GraphDatabase.driver(creds.uri, auth=(creds.username, creds.password))
+    try:
+        with driver.session(database=creds.database) as session:
+            # Drop constraints
+            result = session.run("SHOW CONSTRAINTS")
+            for record in result:
+                constraint_name = record.get("name")
+                if constraint_name:
+                    session.run(f"DROP CONSTRAINT {constraint_name}")
+
+            # Drop indexes
+            result = session.run("SHOW INDEXES")
+            for record in result:
+                index_name = record.get("name")
+                if index_name:
+                    session.run(f"DROP INDEX {index_name} IF EXISTS")
+
+            # Delete all nodes and relationships in batches
+            deleted_count = -1
+            while deleted_count != 0:
+                result = session.run("""
+                    MATCH (n)
+                    OPTIONAL MATCH (n)-[r]-()
+                    WITH n, r LIMIT $batch_size
+                    DELETE n, r
+                    RETURN count(n) as deletedNodesCount
+                    """, batch_size=batch_size)
+                records = list(result)
+                deleted_count = records[0]["deletedNodesCount"] if records else 0
+    finally:
+        driver.close()
+
+###############################################################################
+# Public - Transfer Functions
+###############################################################################
 
 def transfer(
     source_creds: Neo4jCredentials,
     target_creds: Neo4jCredentials,
     spec: TransferSpec,
-):
+) -> UploadResult:
     """Transfer data from one Neo4j instance to another.
 
     Args:
-        source_creds (Neo4jCredentials): Credentials for the source Neo4j instance
-
-        target_creds (Neo4jCredentials): Credentials for the target Neo4j instance
-
-        spec (TransferSpec): Specification for the data transfer
+        source_creds: Credentials for the source Neo4j instance
+        target_creds: Credentials for the target Neo4j instance
+        spec: Specification for the data transfer
 
     Returns:
-        A neo4j_uploader.models.UploadResult object with details of the upload
+        UploadResult object with details of the upload
     """
-
     validate_credentials(source_creds)
     validate_credentials(target_creds)
 
-    nodes = get_nodes(source_creds, spec)
-    rels = get_relationships(source_creds, spec)
+    start_time = datetime.now()
 
-    result = upload(
-        target_creds,
-        nodes,
-        rels,
-        spec.overwrite_target,
+    # Reset target database if specified
+    if getattr(spec, 'reset_target', False):
+        _reset_target_db(target_creds, spec.batch_size)
+
+    src_driver = GraphDatabase.driver(
+        source_creds.uri, 
+        auth=(source_creds.username, source_creds.password)
+    )
+    tgt_driver = GraphDatabase.driver(
+        target_creds.uri, 
+        auth=(target_creds.username, target_creds.password)
     )
 
-    return result
+    try:
+        with src_driver.session(database=source_creds.database) as src, \
+             tgt_driver.session(database=target_creds.database) as tgt:
+            
+            logger.info("=== Copying nodes ===")
+            node_labels = getattr(spec, 'node_labels', None)
+            id_map = _copy_nodes(src, tgt, node_labels, spec.batch_size)
+            logger.info(f"  → {len(id_map)} nodes copied")
 
+            logger.info("=== Copying relationships ===")
+            rel_types = getattr(spec, 'relationship_types', None)
+            all_relationships = _copy_relationships(src, tgt, id_map, rel_types, spec.batch_size)
+            logger.info(f"  → {len(all_relationships)} relationships copied")
+
+            return UploadResult(
+                started_at=start_time,
+                records_total=len(id_map) + len(all_relationships),
+                records_completed=len(id_map) + len(all_relationships),
+                finished_at=datetime.now(),
+                seconds_to_complete=(datetime.now() - start_time).total_seconds(),
+                was_successful=True,
+                nodes_created=len(id_map),
+                relationships_created=len(all_relationships),
+                properties_set=0,
+            )
+    finally:
+        src_driver.close()
+        tgt_driver.close()
 
 def transfer_generator(
     source_creds: Neo4jCredentials,
     target_creds: Neo4jCredentials,
     spec: TransferSpec,
-):
-    """Transfer data from one Neo4j instance to another.
+) -> Generator[UploadResult, None, None]:
+    """Transfer data from one Neo4j instance to another with progress updates.
 
     Args:
-        source_creds (Neo4jCredentials): Credentials for the source Neo4j instance
+        source_creds: Credentials for the source Neo4j instance
+        target_creds: Credentials for the target Neo4j instance
+        spec: Specification for the data transfer
 
-        target_creds (Neo4jCredentials): Credentials for the target Neo4j instance
-
-        spec (TransferSpec): Specification for the data transfer
-
-    Returns:
-        A generator of neo4j_uploader.models.UploadResult objects with details of the upload
+    Yields:
+        UploadResult objects with progress updates during the transfer
     """
-
     validate_credentials(source_creds)
     validate_credentials(target_creds)
 
-    nodes = get_nodes(source_creds, spec)
-    rels = get_relationships(source_creds, spec)
+    start_time = datetime.now()
 
-    return upload_generator(
-        target_creds,
-        nodes,
-        rels,
-        spec.overwrite_target,
+    # Reset target database if specified
+    if getattr(spec, 'reset_target', False):
+        _reset_target_db(target_creds, spec.batch_size)
+
+    src_driver = GraphDatabase.driver(
+        source_creds.uri, 
+        auth=(source_creds.username, source_creds.password)
+    )
+    tgt_driver = GraphDatabase.driver(
+        target_creds.uri, 
+        auth=(target_creds.username, target_creds.password)
     )
 
+    try:
+        with src_driver.session(database=source_creds.database) as src, \
+             tgt_driver.session(database=target_creds.database) as tgt:
+            
+            logger.info("=== Copying nodes ===")
+            node_labels = getattr(spec, 'node_labels', None)
+            id_map = _copy_nodes(src, tgt, node_labels, spec.batch_size)
+            nodes_copied = len(id_map)
+            logger.info(f"  → {nodes_copied} nodes copied")
+
+            # Yield progress after nodes are copied
+            yield UploadResult(
+                started_at=start_time,
+                records_total=nodes_copied,  # Will be updated after relationships
+                records_completed=nodes_copied,
+                finished_at=None,
+                seconds_to_complete=(datetime.now() - start_time).total_seconds(),
+                was_successful=True,
+                nodes_created=nodes_copied,
+                relationships_created=0,
+                properties_set=0,
+            )
+
+            logger.info("=== Copying relationships ===")
+            rel_types = getattr(spec, 'relationship_types', None)
+            all_relationships = _copy_relationships(src, tgt, id_map, rel_types, spec.batch_size)
+            relationships_copied = len(all_relationships)
+            logger.info(f"  → {relationships_copied} relationships copied")
+
+            # Final yield with complete results
+            yield UploadResult(
+                started_at=start_time,
+                records_total=nodes_copied + relationships_copied,
+                records_completed=nodes_copied + relationships_copied,
+                finished_at=datetime.now(),
+                seconds_to_complete=(datetime.now() - start_time).total_seconds(),
+                was_successful=True,
+                nodes_created=nodes_copied,
+                relationships_created=relationships_copied,
+                properties_set=0,
+            )
+    finally:
+        src_driver.close()
+        tgt_driver.close()
 
 def undo(creds: Neo4jCredentials, spec: TransferSpec):
-
-    timestamp_key = spec.timestamp_key
-    ds_string = f"{spec.timestamp.isoformat()}"
-    query = f"""
-    MATCH (n)
-    WHERE n.`{timestamp_key}` = $datetime
-    DETACH DELETE n
-    """
-    params = {"datetime": ds_string}
-    _, summary, _ = execute_query(creds, query, params)
-
-    return summary
-
-
-def upload(
-    creds: Neo4jCredentials,
-    nodes: list[Nodes],
-    relationships: list[Relationships],
-    overwrite: bool = False,
-):
-    """Upload the data to the target Neo4j instance
+    """Undo a transfer based on TransferSpec timestamp.
 
     Args:
-        creds (Neo4jCredentials): Neo4j Credentials object for the target Neo4j instance
-
-        nodes (list[Nodes]): List of Nodes to upload
-        relationships (list[Relationships]): List of Relationships to upload
-        overwrite (bool, optional): Should the target database data be overwritten (deleted prior to upload). Defaults to False.
+        creds: Credentials for the Neo4j instance
+        spec: Transfer specification containing timestamp information
 
     Returns:
-        UploadResults: UploadResults object from the Neo4j uploader package.
+        Query execution summary
     """
-
-    n4j_config = Neo4jConfig(
-        neo4j_uri=creds.uri,
-        neo4j_user=creds.username,
-        neo4j_password=creds.password,
-        overwrite=overwrite,
-    )
-    graph_data = GraphData(nodes=nodes, relationships=relationships)
-
-    result = batch_upload(n4j_config, graph_data)
-
-    return result
-
-
-def upload_generator(
-    creds: Neo4jCredentials,
-    nodes: list[Nodes],
-    relationships: list[Relationships],
-    overwrite: bool = False,
-):
-    """Upload the data to the target Neo4j instance
-
-    Args:
-        creds (Neo4jCredentials): Neo4j Credentials object for the target Neo4j instance
-
-        nodes (list[Nodes]): List of Nodes to upload
-        relationships (list[Relationships]): List of Relationships to upload
-        overwrite (bool, optional): Should the target database data be overwritten (deleted prior to upload). Defaults to False.
-
-    Returns:
-        UploadResults: Generator of UploadResults object from the Neo4j uploader package.
-    """
-
-    n4j_config = Neo4jConfig(
-        neo4j_uri=creds.uri,
-        neo4j_user=creds.username,
-        neo4j_password=creds.password,
-        overwrite=overwrite,
-    )
-    graph_data = GraphData(nodes=nodes, relationships=relationships)
-
-    result = batch_upload_generator(n4j_config, graph_data)
-
-    return result
-
-
-def get_node_dicts(creds: Neo4jCredentials, spec: TransferSpec) -> list[dict]:
-    """Retrieve Nodes and convert to a list of dicts from source"""
-    result = []
-    for label in spec.node_labels:
-
-        nodes_query = f"""
-            MATCH (n:`{label}`)
-            RETURN n
+    timestamp_key = getattr(spec, 'timestamp_key', 'transfer_timestamp')
+    timestamp_value = spec.timestamp.isoformat()
+    
+    driver = GraphDatabase.driver(creds.uri, auth=(creds.username, creds.password))
+    try:
+        with driver.session(database=creds.database) as session:
+            query = f"""
+            MATCH (n)
+            WHERE n.`{timestamp_key}` = $datetime
+            DETACH DELETE n
+            RETURN count(n) as deletedCount
             """
-        records, _, _ = execute_query(creds, nodes_query)
+            result = session.run(query, datetime=timestamp_value)
+            
+            # Get the data first, then consume
+            record = result.single()
+            deleted_count = record['deletedCount'] if record else 0
+            summary = result.consume()
+            
+            logger.info(f"Undo operation completed: deleted {deleted_count} nodes")
+            return summary
+    finally:
+        driver.close()
 
-        logger.info(f"\n Number of {label} nodes: {len(records)}")
-        if len(records) > 0:
-            logger.info(f"\n First Node: {records[0]}")
-
-        converted_records = []
-        for n in records:
-            node_raw = n.data()["n"]
-            converted_records.append(node_raw)
-
-        result.extend(converted_records)
-    return result
-
-
-def get_nodes(creds: Neo4jCredentials, spec: TransferSpec) -> list[Nodes]:
-    """Retrieve Nodes and convert to a list of Uploader Nodes Spec from source and format for uploading"""
-
-    # Get nodes and convert to upload format
-    result = []
-    for label in spec.node_labels:
-
-        nodes_query = f"""
-            MATCH (n:`{label}`)
-            RETURN n
-            """
-        records, _, _ = execute_query(creds, nodes_query)
-
-        logger.info(f"\n Number of {label} nodes: {len(records)}")
-        if len(records) > 0:
-            logger.info(f"\n First Node: {records[0]}")
-
-        converted_records = []
-        for n in records:
-            node_raw = n.data()["n"]
-
-            # Copy to editable dict
-            node = dict(**node_raw)
-
-            if spec.should_append_data:
-                # Get original element id if specified in transfer spec
-                element_id = n.values()[0].element_id
-
-                # Add default transfer related data
-                node.update(
-                    {
-                        spec.element_id_key: element_id,
-                        spec.timestamp_key: spec.timestamp.isoformat(),
-                    }
-                )
-
-            converted_records.append(node)
-
-        nodes_spec = Nodes(
-            labels=[label], key=spec.element_id_key, records=converted_records
-        )
-
-        result.append(nodes_spec)
-
-    return result
-
-
-def get_relationships(
-    creds: Neo4jCredentials, spec: TransferSpec
-) -> list[Relationships]:
-    """Retrieve Relationships from source and format for uploading"""
-
-    result = []
-    for type in spec.relationship_types:
-        query = """
-            MATCH (n)-[r]->(n2)
-            WHERE any(label IN labels(n) WHERE label IN $labels) AND any(label IN labels(n2) WHERE label IN $labels) AND type(r) in $types
-            RETURN n, r, n2
-        """
-        params = {"labels": spec.node_labels, "types": [type]}
-        records, _, _ = execute_query(creds, query, params)
-
-        source_node = TargetNode(
-            node_label=None,
-            node_key=spec.element_id_key,
-            record_key=f"_from_{spec.element_id_key}",
-        )
-        target_node = TargetNode(
-            node_label=None,
-            node_key=spec.element_id_key,
-            record_key=f"_to_{spec.element_id_key}",
-        )
-
-        converted_records = []
-        for rec in records:
-            from_eid = rec.values()[0].element_id
-            to_eid = rec.values()[2].element_id
-            r_eid = rec.values()[1].element_id
-
-            # TODO: Relationship properties
-
-            # Required data to connect relationships with source and target nodes
-            rel_rec = {
-                f"_from_{spec.element_id_key}": from_eid,
-                f"_to_{spec.element_id_key}": to_eid,
-            }
-
-            if spec.should_append_data:
-                # Add default transfer related data
-                rel_rec.update(
-                    {
-                        spec.element_id_key: r_eid,
-                        spec.timestamp_key: spec.timestamp.isoformat(),
-                    }
-                )
-            converted_records.append(rel_rec)
-
-        rels_spec = Relationships(
-            type=type,
-            from_node=source_node,
-            to_node=target_node,
-            records=converted_records,
-        )
-        result.append(rels_spec)
-
-    return result
-
+###############################################################################
+# Public - Information Functions
+###############################################################################
 
 def get_node_labels(creds: Neo4jCredentials) -> list[str]:
     """Return a list of Node labels from a specified Neo4j instance.
@@ -334,3 +430,71 @@ def get_relationship_types(creds: Neo4jCredentials) -> list[str]:
 
     logger.info("Relationships found: " + str(result))
     return result
+
+###############################################################################
+# Public - Reset Target Database Functions
+###############################################################################
+
+def drop_target_db_constraints(
+    tgt_sess: Session
+):
+    
+    logger.info("=== Purging Constraints from Target DB ===")
+
+    query = "SHOW CONSTRAINTS"
+    result = tgt_sess.run(query)
+
+    logger.debug(f"Drop constraints results: {result}")
+
+    # Have to make a drop constraint request for each individually!
+    for record in result:
+        constraint_name = record.get("name", None)
+        if constraint_name is not None:
+            drop_query = f"DROP CONSTRAINT {constraint_name}"
+            drop_result = tgt_sess.run(drop_query)
+            logger.debug(f"Drop constraint {constraint_name} results: {drop_result}")
+
+    # This should now show empty
+    result = tgt_sess.run(query)
+    return result
+
+def drop_target_db_indexes(
+    tgt_sess: Session
+):
+    logger.info("=== Purging Indexes from Target DB ===")
+    query = "SHOW INDEXES"
+    result = tgt_sess.run(query)
+
+    # Have to make a drop index request for each individually!
+    for record in result:
+        index_name = record.get("name", None)
+        if index_name is not None:
+            drop_query = f"DROP INDEX {index_name} IF EXISTS"
+            drop_result = tgt_sess.run(drop_query)
+
+    return result
+
+def reset_target_db(creds: Neo4jCredentials, batch_size: int = DEFAULT_BATCH_SIZE) -> None:
+
+    logger.info("=== Resetting Target DB ===")
+
+    drv_tgt: Driver = GraphDatabase.driver(creds.uri, auth=(creds.username, creds.password))
+    try:
+        with drv_tgt.session() as tgt:
+            drop_target_db_constraints(tgt)
+            drop_target_db_indexes(tgt)
+
+            deleted_nodes_count = -1
+            while deleted_nodes_count != 0:
+                query = """
+                MATCH (n)
+                OPTIONAL MATCH (n)-[r]-()
+                WITH n, r LIMIT $batch_size
+                DELETE n, r
+                RETURN count(n) as deletedNodesCount
+                """
+                result = tgt.run(query, batch_size=batch_size)
+                records = list(result)
+                deleted_nodes_count = records[0]["deletedNodesCount"] if records else 0
+    finally:
+        drv_tgt.close()

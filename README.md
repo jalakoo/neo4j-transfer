@@ -38,3 +38,6 @@ A transfer can also be undone by passing the same TransferSpec:
 ```
 undo(target_creds, spec)
 ```
+
+## License
+MIT
