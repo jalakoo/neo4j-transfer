@@ -12,6 +12,7 @@ python = "^3.11"
 pydantic = "^2.7.1"
 neo4j-rust-ext = "^5.28.1.0"
 python-dotenv = "^1.1.1"
+pdoc = "^15.0.4"
 
 
 [build-system]
