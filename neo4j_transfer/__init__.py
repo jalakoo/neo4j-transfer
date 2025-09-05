@@ -74,11 +74,15 @@ def _batch_create_relationships(
     return relationships
 
 def _copy_nodes(
-    src: Session, 
-    tgt: Session, 
-    labels: List[str], 
+    src: Session,
+    tgt: Session,
+    labels: List[str],
     page_size: int = DEFAULT_BATCH_SIZE,
-    progress_callback: callable = None
+    progress_callback: callable = None,
+    should_append_data: bool = False,
+    element_id_key: str = "_transfer_element_id",
+    timestamp_key: str = "_transfer_timestamp",
+    timestamp: datetime | None = None,
 ) -> Dict[str, str]:
     """Copy nodes with specified labels."""
     id_map: Dict[str, str] = {}
@@ -120,6 +124,14 @@ def _copy_nodes(
             )
         
         batch = [dict(record) for record in result]
+        if should_append_data and batch:
+            ts_value = (timestamp or datetime.now()).isoformat()
+            for row in batch:
+                props = row.get("props", {}) or {}
+                # Append source element id and timestamp to properties
+                props[element_id_key] = row.get("eid")
+                props[timestamp_key] = ts_value
+                row["props"] = props
         if not batch:
             break
         
@@ -145,7 +157,11 @@ def _copy_relationships(
     id_map: Dict[str, str],
     types: List[str] = None,
     page_size: int = DEFAULT_BATCH_SIZE,
-    progress_callback: callable = None
+    progress_callback: callable = None,
+    should_append_data: bool = False,
+    element_id_key: str = "_transfer_element_id",
+    timestamp_key: str = "_transfer_timestamp",
+    timestamp: datetime | None = None,
 ) -> List[Dict]:
     """Copy relationships with optional type filtering."""
     all_relationships: List[Dict] = []
@@ -172,7 +188,7 @@ def _copy_relationships(
                 MATCH (a)-[r]->(b)
                 WHERE type(r) IN $types
                 WITH r, a, b SKIP $skip LIMIT $limit
-                RETURN type(r) AS type, elementId(a) AS start, elementId(b) AS end, properties(r) AS props
+                RETURN type(r) AS type, elementId(r) AS eid, elementId(a) AS start, elementId(b) AS end, properties(r) AS props
                 """,
                 skip=skip, limit=page_size, types=types
             )
@@ -181,7 +197,7 @@ def _copy_relationships(
                 """
                 MATCH (a)-[r]->(b)
                 WITH r, a, b SKIP $skip LIMIT $limit
-                RETURN type(r) AS type, elementId(a) AS start, elementId(b) AS end, properties(r) AS props
+                RETURN type(r) AS type, elementId(r) AS eid, elementId(a) AS start, elementId(b) AS end, properties(r) AS props
                 """,
                 skip=skip, limit=page_size
             )
@@ -191,11 +207,16 @@ def _copy_relationships(
             start_tgt = id_map.get(rec["start"])
             end_tgt = id_map.get(rec["end"])
             if start_tgt and end_tgt:
+                props = rec.get("props", {}) or {}
+                if should_append_data:
+                    ts_value = (timestamp or datetime.now()).isoformat()
+                    props[element_id_key] = rec.get("eid")
+                    props[timestamp_key] = ts_value
                 batch.append({
                     "type": rec["type"],
                     "start": start_tgt,
                     "end": end_tgt,
-                    "props": rec["props"],
+                    "props": props,
                 })
 
         if not batch:
@@ -324,6 +345,13 @@ def transfer_generator(
     validate_credentials(target_creds)
 
     start_time = datetime.now()
+    # Set a single transfer timestamp so all batches share the same value
+    transfer_timestamp = getattr(spec, 'timestamp', None) or start_time
+    try:
+        # Ensure spec reflects the actual transfer timestamp (useful for undo)
+        setattr(spec, 'timestamp', transfer_timestamp)
+    except Exception:
+        pass
     progress = {
         'nodes_copied': 0,
         'total_nodes': 0,
@@ -373,10 +401,15 @@ def transfer_generator(
                 )
 
             id_map = _copy_nodes(
-                src, tgt, 
-                node_labels, 
+                src,
+                tgt,
+                node_labels,
                 spec.batch_size,
-                progress_callback=node_progress
+                progress_callback=node_progress,
+                should_append_data=getattr(spec, 'should_append_data', False),
+                element_id_key=getattr(spec, 'element_id_key', '_transfer_element_id'),
+                timestamp_key=getattr(spec, 'timestamp_key', '_transfer_timestamp'),
+                timestamp=transfer_timestamp,
             )
             
             controller.check_stop()
@@ -400,11 +433,16 @@ def transfer_generator(
                 )
 
             all_relationships = _copy_relationships(
-                src, tgt, 
-                id_map, 
-                rel_types, 
+                src,
+                tgt,
+                id_map,
+                rel_types,
                 spec.batch_size,
-                progress_callback=rel_progress
+                progress_callback=rel_progress,
+                should_append_data=getattr(spec, 'should_append_data', False),
+                element_id_key=getattr(spec, 'element_id_key', '_transfer_element_id'),
+                timestamp_key=getattr(spec, 'timestamp_key', '_transfer_timestamp'),
+                timestamp=transfer_timestamp,
             )
             
             # Final result with complete information
