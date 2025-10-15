@@ -75,6 +75,7 @@ class TransferSpec(BaseModel):
 # Ported from old Neo4j Uploader
 ###############################################################################
 
+
 class Neo4jConfig(BaseModel):
     """
     Object for specifying target local or hosted Neo4j database instance to upload to data to.
@@ -101,6 +102,8 @@ class Neo4jConfig(BaseModel):
         Returns:
             tuple(str, str, str): Neo4j credentials uri, user, password
         """
+        return (self.neo4j_uri, self.neo4j_user, self.neo4j_password)
+
 
 class Nodes(BaseModel):
     """Configuration object for uploading nodes to a Neo4j database.
@@ -155,6 +158,7 @@ class Relationships(BaseModel):
     auto_exclude_keys: Optional[bool] = True
     dedupe: Optional[bool] = True
 
+
 class GraphData(BaseModel):
     """Object representation of nodes and relationships specifications and records to upload to a specified Neo4j database.
 
@@ -194,7 +198,7 @@ class UploadResult(BaseModel):
 
     started_at: datetime
     records_total: int
-    records_completed: Optional[int] = 0
+    records_completed: int = 0
     finished_at: Optional[datetime] = None
     was_successful: bool = False
     seconds_to_complete: Optional[float] = None
