@@ -1,4 +1,4 @@
-# Neo4j Transfer
+git s# Neo4j Transfer
 
 A Python tool for efficiently transferring selected data from one Neo4j instance to another, with support for batch processing, progress tracking, and transfer metadata.
 
@@ -11,6 +11,10 @@ A Python tool for efficiently transferring selected data from one Neo4j instance
 - **Undo Capability**: Remove transferred data using the original transfer specification
 - **Database Reset**: Option to clear target database before transfer
 - **Stoppable Transfers**: Cancel long-running transfers gracefully
+
+## Documentation
+
+📖 **[View Full API Documentation](docs/neo4j_transfer.html)**
 
 ## Installation
 
