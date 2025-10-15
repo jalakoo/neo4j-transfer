@@ -2,7 +2,7 @@ from .models import Neo4jCredentials, TransferSpec, UploadResult
 from .n4j import validate_credentials, execute_query
 from ._logger import logger
 from neo4j import GraphDatabase, Driver, Session
-from typing import List, Dict, Any, Generator, Union
+from typing import List, Dict, Any, Generator, Union, Optional
 from collections import defaultdict
 from datetime import datetime
 from dotenv import load_dotenv
@@ -82,7 +82,7 @@ def _copy_nodes(
     should_append_data: bool = False,
     element_id_key: str = "_transfer_element_id",
     timestamp_key: str = "_transfer_timestamp",
-    timestamp: datetime | None = None,
+    timestamp: Optional[datetime] = None,
 ) -> Dict[str, str]:
     """Copy nodes with specified labels."""
     id_map: Dict[str, str] = {}
@@ -161,7 +161,7 @@ def _copy_relationships(
     should_append_data: bool = False,
     element_id_key: str = "_transfer_element_id",
     timestamp_key: str = "_transfer_timestamp",
-    timestamp: datetime | None = None,
+    timestamp: Optional[datetime] = None,
 ) -> List[Dict]:
     """Copy relationships with optional type filtering."""
     all_relationships: List[Dict] = []
