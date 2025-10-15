@@ -1,5 +1,5 @@
 from neo4j import GraphDatabase
-from neo4j_transfer.models import Neo4jCredentials
+from .models import Neo4jCredentials
 
 
 def validate_credentials(creds: Neo4jCredentials):

@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "neo4j-transfer"
-version = "0.1.1"
-description = ""
+version = "0.2.0"
+description = "Tool for transferring select data from one active Neo4j instance to another."
 authors = ["jalakoo <jalakoo@gmail.com>"]
 readme = "README.md"
 packages = [{include = "neo4j_transfer"}]
@@ -10,7 +10,9 @@ packages = [{include = "neo4j_transfer"}]
 [tool.poetry.dependencies]
 python = "^3.11"
 pydantic = "^2.7.1"
-neo4j-uploader = "^0.6.0"
+neo4j-rust-ext = "^5.28.1.0"
+python-dotenv = "^1.1.1"
+pdoc = "^15.0.4"
 
 
 [build-system]
